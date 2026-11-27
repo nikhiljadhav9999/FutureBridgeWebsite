@@ -5,6 +5,10 @@ Crawls at most 10 pages on www.futurebridge.com, then checks every discovered
 link with a HEAD request, falling back to GET. Flags HTTP 4xx/5xx responses,
 timeouts, request failures, and internal links that redirect to the homepage.
 
+Social media links (linkedin.com, facebook.com, twitter.com, x.com,
+instagram.com, youtube.com) are reported as SKIPPED_SOCIAL and never as errors.
+WordPress login/admin/logout links are ignored.
+
 Results are written to link_check.log. Exits with status 1 when issues are found.
 
 Usage:
@@ -15,10 +19,12 @@ Requires: requests, beautifulsoup4
 
 import argparse
 import logging
+import os
+import sys
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import parse_qs, urldefrag, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,6 +32,14 @@ from bs4 import BeautifulSoup
 START_URL = "https://www.futurebridge.com/"
 CRAWL_HOST = "www.futurebridge.com"
 INTERNAL_HOSTS = {"www.futurebridge.com", "futurebridge.com"}
+SOCIAL_DOMAINS = {
+    "linkedin.com",
+    "facebook.com",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "youtube.com",
+}
 MAX_PAGES = 10
 TIMEOUT = 15
 USER_AGENT = (
@@ -66,6 +80,19 @@ def is_homepage(url):
     return urlparse(url).path in ("", "/")
 
 
+def is_social(url):
+    host = host_of(url)
+    return any(host == domain or host.endswith("." + domain) for domain in SOCIAL_DOMAINS)
+
+
+def is_ignored(url):
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if path.startswith("/wp-login.php") or path == "/wp-admin" or path.startswith("/wp-admin/"):
+        return True
+    return "logout" in parse_qs(parsed.query).get("action", [])
+
+
 def extract_links(html, page_url):
     soup = BeautifulSoup(html, "html.parser")
     links = []
@@ -76,8 +103,9 @@ def extract_links(html, page_url):
         link = normalize(urljoin(page_url, href))
         if urlparse(link).scheme not in ("http", "https"):
             continue
+        text = " ".join(anchor.get_text(" ", strip=True).split())
         if link:
-            links.append(link)
+            links.append((link, text))
     return links
 
 
@@ -119,12 +147,17 @@ def find_issues(result):
     return issues
 
 
+def severity_of(url):
+    return "High" if is_internal(url) else "Low"
+
+
 def crawl(session, start_url, max_pages):
-    """Return {link: source_page} for links found in the crawled pages."""
+    """Return ({link: [(page, text), ...]}, ignored_count) for crawled pages."""
     queue = deque([normalize(start_url)])
     queued = set(queue)
     crawled = []
     links = {}
+    ignored = set()
 
     while queue and len(crawled) < max_pages:
         page_url = queue.popleft()
@@ -154,8 +187,13 @@ def crawl(session, start_url, max_pages):
         crawled.append(page_url)
         log.info("PAGE %s %s -> %s", status, page_url, final_url)
 
-        for link in extract_links(html, final_url):
-            links.setdefault(link, page_url)
+        for link, text in extract_links(html, final_url):
+            if is_ignored(link):
+                ignored.add(link)
+                continue
+            occurrences = links.setdefault(link, [])
+            if (page_url, text) not in occurrences:
+                occurrences.append((page_url, text))
             if (
                 is_crawlable(link)
                 and link not in queued
@@ -165,18 +203,44 @@ def crawl(session, start_url, max_pages):
                 queue.append(link)
 
     log.info("Crawled %d page(s)", len(crawled))
-    return links
+    return links, len(ignored)
+
+
+def stdout_is(path):
+    """True when stdout is already redirected to the log file."""
+    try:
+        out = os.fstat(sys.stdout.fileno())
+        target = os.stat(path)
+    except (OSError, ValueError):
+        return False
+    return (out.st_dev, out.st_ino) == (target.st_dev, target.st_ino)
 
 
 def setup_logging(path):
     log.setLevel(logging.INFO)
     formatter = logging.Formatter("%(message)s")
-    file_handler = logging.FileHandler(path, mode="w", encoding="utf-8")
-    file_handler.setFormatter(formatter)
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
-    log.addHandler(file_handler)
     log.addHandler(stream_handler)
+
+    if not stdout_is(path):
+        file_handler = logging.FileHandler(path, mode="w", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        log.addHandler(file_handler)
+
+
+def md_cell(value):
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def status_text(result, found):
+    if result.error:
+        base = result.error
+    elif result.final_url and result.final_url != result.url:
+        base = f"{result.status} -> {result.final_url}"
+    else:
+        base = str(result.status)
+    return f"{base} ({','.join(found)})"
 
 
 def main():
@@ -197,10 +261,10 @@ def main():
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
 
-    links = crawl(session, args.start_url, args.max_pages)
+    links, ignored = crawl(session, args.start_url, args.max_pages)
 
     log.info("")
-    log.info("Links found: %d", len(links))
+    log.info("Links found: %d (ignored wp-login/wp-admin/logout: %d)", len(links), ignored)
     log.info("")
 
     counts = {
@@ -209,14 +273,22 @@ def main():
         "TIMEOUT": 0,
         "REQUEST_ERROR": 0,
         "HOMEPAGE_REDIRECT": 0,
+        "SKIPPED_SOCIAL": 0,
     }
     issues = []
 
-    for url, source_page in sorted(links.items()):
+    for url in sorted(links):
+        page, text = links[url][0]
+
+        if is_social(url):
+            counts["SKIPPED_SOCIAL"] += 1
+            log.info("%-16s %-4s %-4s %s", "SKIPPED_SOCIAL", "-", "-", url)
+            continue
+
         result = check_link(session, url)
         found = find_issues(result)
         if found:
-            issues.append((result, source_page, found))
+            issues.append((severity_of(url), result, text, page, found))
         else:
             counts["OK"] += 1
 
@@ -235,24 +307,31 @@ def main():
 
     log.info("")
     log.info("Summary")
-    log.info("  Links checked:      %d", len(links))
+    log.info("  Links checked:      %d", len(links) - counts["SKIPPED_SOCIAL"])
     log.info("  OK:                 %d", counts["OK"])
     log.info("  HTTP errors:        %d", counts["HTTP_ERROR"])
     log.info("  Timeouts:           %d", counts["TIMEOUT"])
     log.info("  Request errors:     %d", counts["REQUEST_ERROR"])
     log.info("  Homepage redirects: %d", counts["HOMEPAGE_REDIRECT"])
+    log.info("  Skipped social:     %d", counts["SKIPPED_SOCIAL"])
+    log.info("  Ignored wp links:   %d", ignored)
     log.info("  Total issues:       %d", len(issues))
 
     if issues:
         log.info("")
         log.info("Issues")
-        for result, source_page, found in issues:
+        log.info("| Severity | Link text | Broken URL | Status / final URL | Found on page |")
+        log.info("| --- | --- | --- | --- | --- |")
+        for severity, result, text, page, found in sorted(
+            issues, key=lambda item: (item[0] != "High", item[1].url)
+        ):
             log.info(
-                "  [%s] %s (found on %s)%s",
-                ",".join(found),
-                result.url,
-                source_page,
-                f" -> {result.final_url}" if result.final_url and result.final_url != result.url else "",
+                "| %s | %s | %s | %s | %s |",
+                severity,
+                md_cell(text or "(no text)"),
+                md_cell(result.url),
+                md_cell(status_text(result, found)),
+                md_cell(page),
             )
 
     return 1 if issues else 0
