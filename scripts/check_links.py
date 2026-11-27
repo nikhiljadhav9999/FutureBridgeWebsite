@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Check links found on https://www.futurebridge.com.
+"""Check links found on a website.
 
-Crawls at most 10 pages on www.futurebridge.com, then checks every discovered
-link with a HEAD request, falling back to GET. Flags HTTP 4xx/5xx responses,
-timeouts, request failures, and internal links that redirect to the homepage.
+Crawls at most 10 pages of the site at --start-url, then checks every
+discovered link with a HEAD request, falling back to GET. Flags HTTP 4xx/5xx
+responses, timeouts, request failures, and internal links that redirect to the
+homepage. The start URL's domain and all of its subdomains count as internal.
 
 Social media links (linkedin.com, facebook.com, twitter.com, x.com,
 instagram.com, youtube.com) are reported as SKIPPED_SOCIAL and never as errors.
@@ -12,7 +13,7 @@ WordPress login/admin/logout links are ignored.
 Results are written to link_check.log. Exits with status 1 when issues are found.
 
 Usage:
-    python scripts/check_links.py [--max-pages N] [--start-url URL] [--output FILE]
+    python scripts/check_links.py [--start-url URL] [--max-pages N] [--output FILE]
 
 Requires: requests, beautifulsoup4
 """
@@ -30,8 +31,6 @@ import requests
 from bs4 import BeautifulSoup
 
 START_URL = "https://www.futurebridge.com/"
-CRAWL_HOST = "www.futurebridge.com"
-INTERNAL_HOSTS = {"www.futurebridge.com", "futurebridge.com"}
 SOCIAL_DOMAINS = {
     "linkedin.com",
     "facebook.com",
@@ -68,12 +67,18 @@ def host_of(url):
     return (urlparse(url).hostname or "").lower()
 
 
-def is_internal(url):
-    return host_of(url) in INTERNAL_HOSTS
+def base_domain(url):
+    host = host_of(url)
+    return host[4:] if host.startswith("www.") else host
 
 
-def is_crawlable(url):
-    return host_of(url) == CRAWL_HOST
+def is_internal(url, domain):
+    host = host_of(url)
+    return bool(domain) and (host == domain or host.endswith("." + domain))
+
+
+def is_crawlable(url, crawl_hosts):
+    return host_of(url) in crawl_hosts
 
 
 def is_homepage(url):
@@ -127,7 +132,7 @@ def check_link(session, url):
         return LinkResult(url, None, None, type(exc).__name__, "GET")
 
 
-def find_issues(result):
+def find_issues(result, domain):
     issues = []
     if result.error == "timeout":
         issues.append("TIMEOUT")
@@ -137,24 +142,25 @@ def find_issues(result):
         issues.append("HTTP_ERROR")
 
     if (
-        is_internal(result.url)
+        is_internal(result.url, domain)
         and not is_homepage(result.url)
         and result.final_url
-        and is_internal(result.final_url)
+        and is_internal(result.final_url, domain)
         and is_homepage(result.final_url)
     ):
         issues.append("HOMEPAGE_REDIRECT")
     return issues
 
 
-def severity_of(url):
-    return "High" if is_internal(url) else "Low"
+def severity_of(url, domain):
+    return "High" if is_internal(url, domain) else "Low"
 
 
-def crawl(session, start_url, max_pages):
+def crawl(session, start_url, max_pages, domain):
     """Return ({link: [(page, text), ...]}, ignored_count) for crawled pages."""
     queue = deque([normalize(start_url)])
     queued = set(queue)
+    crawl_hosts = {host_of(start_url), domain, f"www.{domain}"}
     crawled = []
     links = {}
     ignored = set()
@@ -186,6 +192,8 @@ def crawl(session, start_url, max_pages):
 
         crawled.append(page_url)
         log.info("PAGE %s %s -> %s", status, page_url, final_url)
+        if is_internal(final_url, domain):
+            crawl_hosts.add(host_of(final_url))
 
         for link, text in extract_links(html, final_url):
             if is_ignored(link):
@@ -195,7 +203,7 @@ def crawl(session, start_url, max_pages):
             if (page_url, text) not in occurrences:
                 occurrences.append((page_url, text))
             if (
-                is_crawlable(link)
+                is_crawlable(link, crawl_hosts)
                 and link not in queued
                 and len(crawled) + len(queue) < max_pages
             ):
@@ -244,16 +252,18 @@ def status_text(result, found):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Check links on www.futurebridge.com")
+    parser = argparse.ArgumentParser(description="Check links on a website")
     parser.add_argument("--start-url", default=START_URL)
     parser.add_argument("--max-pages", type=int, default=MAX_PAGES)
     parser.add_argument("--output", default="link_check.log")
     args = parser.parse_args()
+    domain = base_domain(args.start_url)
 
     setup_logging(args.output)
     log.info("Link check report")
     log.info("Started: %s", datetime.now().isoformat(timespec="seconds"))
     log.info("Start URL: %s", args.start_url)
+    log.info("Internal domain: %s", domain)
     log.info("Max pages: %d", args.max_pages)
     log.info("Timeout: %ds", TIMEOUT)
     log.info("")
@@ -261,7 +271,7 @@ def main():
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
 
-    links, ignored = crawl(session, args.start_url, args.max_pages)
+    links, ignored = crawl(session, args.start_url, args.max_pages, domain)
 
     log.info("")
     log.info("Links found: %d (ignored wp-login/wp-admin/logout: %d)", len(links), ignored)
@@ -286,9 +296,9 @@ def main():
             continue
 
         result = check_link(session, url)
-        found = find_issues(result)
+        found = find_issues(result, domain)
         if found:
-            issues.append((severity_of(url), result, text, page, found))
+            issues.append((severity_of(url, domain), result, text, page, found))
         else:
             counts["OK"] += 1
 
